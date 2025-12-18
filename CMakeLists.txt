@@ -14,10 +14,12 @@ find_package(Threads REQUIRED)
 set(pevents_sources src/pevents.cpp)
 
 add_library(pevents STATIC ${pevents_sources})
+# Use BUILD/INSTALL interface include dirs to avoid exporting source-prefixed paths
 target_include_directories(pevents
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<INSTALL_INTERFACE:include>
 )
 
 set_target_properties(pevents PROPERTIES
@@ -37,33 +39,10 @@ target_compile_definitions(pevents
         $<$<BOOL:${PEVENTS_PULSE}>:PULSE>
 )
 
-# Generate single-header amalgamation similar to meson target
-set(PEVENTS_SINGLE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pevents.hpp")
-add_custom_command(
-    OUTPUT ${PEVENTS_SINGLE_HEADER}
-    COMMAND ${CMAKE_COMMAND}
-        -DINPUTS="${CMAKE_CURRENT_SOURCE_DIR}/src/pevents.h;${CMAKE_CURRENT_SOURCE_DIR}/${pevents_sources}"
-        -DOUTPUT="${PEVENTS_SINGLE_HEADER}"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/pevents_single_header.cmake"
-    DEPENDS ${pevents_sources} src/pevents.h cmake/pevents_single_header.cmake
-    COMMENT "Generating pevents.hpp single-header"
-    VERBATIM
-)
-add_custom_target(pevents_single_header ALL DEPENDS ${PEVENTS_SINGLE_HEADER})
-add_dependencies(pevents pevents_single_header)
-
 # Installation targets
 install(TARGETS pevents EXPORT peventsTargets)
 install(FILES src/pevents.h ${PEVENTS_SINGLE_HEADER} DESTINATION include)
 install(EXPORT peventsTargets FILE peventsTargets.cmake NAMESPACE pevents:: DESTINATION lib/cmake/pevents)
-
-include(CMakePackageConfigHelpers)
-configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/peventsConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/peventsConfig.cmake
-    INSTALL_DESTINATION lib/cmake/pevents
-)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/peventsConfig.cmake DESTINATION lib/cmake/pevents)
 
 if(PEVENTS_BUILD_EXAMPLES AND PEVENTS_WFMO)
     add_subdirectory(examples)

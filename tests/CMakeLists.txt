@@ -10,9 +10,10 @@ set(WFMO_TESTS
     WaitTimeoutAllSignalled
 )
 
-set(TEST_STD c++11)
+# Use numeric C++ standard levels for CMake
+set(TEST_STD 11)
 if (WIN32)
-    set(TEST_STD c++17)
+    set(TEST_STD 17)
 endif()
 
 set(TEST_COMPILE_DEFS)
@@ -50,4 +51,3 @@ if(PEVENTS_WFMO)
         add_test(NAME ${test_name} COMMAND ${test_name})
     endforeach()
 endif()
-
