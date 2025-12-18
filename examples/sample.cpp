@@ -117,6 +117,7 @@ int main() {
     const uint32_t letterThreadCount = dis(gen);
     const uint32_t numberThreadCount = dis(gen);
 
+    threads.reserve(letterThreadCount);
     for (__unused__ uint32_t i = 0; i < letterThreadCount; ++i) {
         threads.emplace_back(letters);
     }
