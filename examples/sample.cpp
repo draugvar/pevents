@@ -5,12 +5,12 @@
  * This code is released under the terms of the MIT License.
  */
 
-#include <assert.h>
+#include <cassert>
 #include <atomic>
 #include <chrono>
 #include <iostream>
 #include <random>
-#include <signal.h>
+#include <csignal>
 #include <thread>
 
 // NB: Keep example STL-only: remove Windows.h dependency and use atomic flag only
@@ -78,7 +78,7 @@ void numbers() {
         // Remember that another instance of this function may be executing concurrently, so after
         // the sleep finishes, make sure to obtain exclusive access by means of this auto-reset
         // event.
-        auto waitResult = WaitForEvent(events[4]); // only one thread here at a time
+        const auto waitResult = WaitForEvent(events[4]); // only one thread here at a time
         assert(waitResult == 0);
         number = numberIndex;
         ++numberIndex;
