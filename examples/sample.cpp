@@ -13,16 +13,16 @@
 #include <signal.h>
 #include <thread>
 
-// NB: On Windows, you must include Winbase.h/Synchapi.h/Windows.h before pevents.h
-#ifdef _WIN32
-#include <Windows.h>
+// NB: Keep example STL-only: remove Windows.h dependency and use atomic flag only
+#ifndef _WIN32
+#include <signal.h>
 #endif
 #include "pevents.h"
 
-#ifdef _WIN32
-#define __unused__  [[maybe_unused]]
+#ifndef _WIN32
+#define __unused__  __attribute__((unused))
 #else
-#define __unused__ __attribute__((unused))
+#define __unused__  [[maybe_unused]]
 #endif
 
 using namespace neosmart;
@@ -104,7 +104,8 @@ int main() {
     act.sa_handler = intHandler; // trigger abort on ctrl+c
     sigaction(SIGINT, &act, NULL);
 #else
-    SetConsoleCtrlHandler((PHANDLER_ROUTINE)intHandler, true);
+    // On Windows, we won't install a console handler; users can close the console or press Ctrl+C
+    // which will terminate the process. Our threads will be joined on normal exit path.
 #endif
 
     vector<std::thread> threads;
@@ -113,8 +114,8 @@ int main() {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dis(1, 10);
 
-    uint32_t letterThreadCount = dis(gen);
-    uint32_t numberThreadCount = dis(gen);
+    const uint32_t letterThreadCount = dis(gen);
+    const uint32_t numberThreadCount = dis(gen);
 
     for (__unused__ uint32_t i = 0; i < letterThreadCount; ++i) {
         threads.emplace_back(letters);

@@ -28,10 +28,10 @@ set_target_properties(pevents PROPERTIES
     CXX_EXTENSIONS OFF
 )
 
-target_link_libraries(pevents
-    PUBLIC
-        Threads::Threads
-)
+# Link Threads to ensure POSIX platforms link pthread when needed
+target_link_libraries(pevents PUBLIC Threads::Threads)
+
+# Only STL used; no extra thread libs needed
 
 target_compile_definitions(pevents
     PUBLIC
@@ -41,7 +41,7 @@ target_compile_definitions(pevents
 
 # Installation targets
 install(TARGETS pevents EXPORT peventsTargets)
-install(FILES src/pevents.h ${PEVENTS_SINGLE_HEADER} DESTINATION include)
+install(FILES src/pevents.h DESTINATION include)
 install(EXPORT peventsTargets FILE peventsTargets.cmake NAMESPACE pevents:: DESTINATION lib/cmake/pevents)
 
 if(PEVENTS_BUILD_EXAMPLES AND PEVENTS_WFMO)
@@ -52,4 +52,3 @@ if(PEVENTS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
-

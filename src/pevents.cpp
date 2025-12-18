@@ -5,15 +5,13 @@
  * SPDX-License-Identifier: MIT
  */
 
-#ifndef _WIN32
-
 #include "pevents.h"
-#include <assert.h>
-#include <errno.h>
-#include <pthread.h>
-#include <sys/time.h>
+#include <cassert>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #ifdef WFMO
 #include <algorithm>
 #include <deque>
@@ -24,20 +22,22 @@ namespace neosmart {
     // Each call to WaitForMultipleObjects initializes a neosmart_wfmo_t object which tracks
     // the progress of the caller's multi-object wait and dispatches responses accordingly.
     // One neosmart_wfmo_t struct is shared for all events in a single WFMO call
-    struct neosmart_wfmo_t_ {
-        pthread_mutex_t Mutex;
-        pthread_cond_t CVariable;
+    struct neosmart_wfmo_t_
+    {
+        std::mutex Mutex;
+        std::condition_variable CVariable;
         std::atomic<int> RefCount;
-        union {
+        union
+        {
             int FiredEvent; // WFSO
             int EventsLeft; // WFMO
-        } Status;
-        bool WaitAll;
+        } Status{};
+        bool WaitAll{};
         std::atomic<bool> StillWaiting;
 
-        void Destroy() {
-            pthread_mutex_destroy(&Mutex);
-            pthread_cond_destroy(&CVariable);
+        void Destroy()
+        {
+            // no-op for std primitives
         }
     };
     typedef neosmart_wfmo_t_ *neosmart_wfmo_t;
@@ -53,9 +53,9 @@ namespace neosmart {
 
     // The basic event structure, passed to the caller as an opaque pointer when creating events
     struct neosmart_event_t_ {
-        pthread_cond_t CVariable;
-        pthread_mutex_t Mutex;
-        bool AutoReset;
+        std::condition_variable CVariable;
+        std::mutex Mutex;
+        bool AutoReset{};
         std::atomic<bool> State;
 #ifdef WFMO
         std::deque<neosmart_wfmo_info_t_> RegisteredWaits;
@@ -63,12 +63,12 @@ namespace neosmart {
     };
 
 #ifdef WFMO
-    static bool RemoveExpiredWaitHelper(neosmart_wfmo_info_t_ wait) {
+    static bool RemoveExpiredWaitHelper(const neosmart_wfmo_info_t_ wait) {
         if (wait.Waiter->StillWaiting.load(std::memory_order_relaxed)) {
             return false;
         }
 
-        int ref_count = wait.Waiter->RefCount.fetch_sub(1, std::memory_order_acq_rel);
+        const int ref_count = wait.Waiter->RefCount.fetch_sub(1, std::memory_order_acq_rel);
         assert(ref_count > 0);
 
         if (ref_count == 1) {
@@ -79,14 +79,8 @@ namespace neosmart {
     }
 #endif // WFMO
 
-    neosmart_event_t CreateEvent(bool manualReset, bool initialState) {
-        neosmart_event_t event = new neosmart_event_t_;
-
-        int result = pthread_cond_init(&event->CVariable, 0);
-        assert(result == 0);
-
-        result = pthread_mutex_init(&event->Mutex, 0);
-        assert(result == 0);
+    neosmart_event_t CreateEvent(const bool manualReset, const bool initialState) {
+        const auto event = new neosmart_event_t_;
 
         event->AutoReset = !manualReset;
         // memory_order_release: if `initialState == true`, allow a load with acquire semantics to
@@ -96,7 +90,7 @@ namespace neosmart {
         return event;
     }
 
-    static int UnlockedWaitForEvent(neosmart_event_t event, uint64_t milliseconds) {
+    static int UnlockedWaitForEvent(neosmart_event_t event, const uint64_t milliseconds, std::unique_lock<std::mutex>& lock) {
         int result = 0;
         // memory_order_relaxed: `State` is only set to true with the mutex held, and we require
         // that this function only be called after the mutex is obtained.
@@ -106,29 +100,19 @@ namespace neosmart {
                 return WAIT_TIMEOUT;
             }
 
-            timespec ts;
             if (milliseconds != WAIT_INFINITE) {
-                timeval tv;
-                gettimeofday(&tv, NULL);
-
-                uint64_t nanoseconds = ((uint64_t)tv.tv_sec) * 1000 * 1000 * 1000 +
-                                       milliseconds * 1000 * 1000 + ((uint64_t)tv.tv_usec) * 1000;
-
-                ts.tv_sec = (time_t) (nanoseconds / 1000 / 1000 / 1000);
-                ts.tv_nsec = (long) (nanoseconds - ((uint64_t)ts.tv_sec) * 1000 * 1000 * 1000);
-            }
-
-            do {
-                // Regardless of whether it's an auto-reset or manual-reset event:
-                // wait to obtain the event, then lock anyone else out
-                if (milliseconds != WAIT_INFINITE) {
-                    result = pthread_cond_timedwait(&event->CVariable, &event->Mutex, &ts);
-                } else {
-                    result = pthread_cond_wait(&event->CVariable, &event->Mutex);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+                while (!event->State.load(std::memory_order_relaxed)) {
+                    if (event->CVariable.wait_until(lock, deadline) == std::cv_status::timeout) {
+                        result = WAIT_TIMEOUT;
+                        break;
+                    }
                 }
-                // memory_order_relaxed: ordering is guaranteed by the mutex, as `State = true` is
-                // only ever written with the mutex held.
-            } while (result == 0 && !event->State.load(std::memory_order_relaxed));
+            } else {
+                while (!event->State.load(std::memory_order_relaxed)) {
+                    event->CVariable.wait(lock);
+                }
+            }
         } else if (event->AutoReset) {
             // It's an auto-reset event that's currently available;
             // we need to stop anyone else from using it
@@ -164,34 +148,25 @@ namespace neosmart {
             }
         }
 
-        int tempResult = pthread_mutex_lock(&event->Mutex);
-        assert(tempResult == 0);
-
-        int result = UnlockedWaitForEvent(event, milliseconds);
-
-        tempResult = pthread_mutex_unlock(&event->Mutex);
-        assert(tempResult == 0);
-
+        std::unique_lock<std::mutex> lock(event->Mutex);
+        const int result = UnlockedWaitForEvent(event, milliseconds, lock);
         return result;
     }
 
 #ifdef WFMO
-    int WaitForMultipleEvents(neosmart_event_t *events, int count, bool waitAll,
-                              uint64_t milliseconds) {
+    int WaitForMultipleEvents(neosmart_event_t *events, const int count, const bool waitAll,
+                              const uint64_t milliseconds) {
         int unused;
         return WaitForMultipleEvents(events, count, waitAll, milliseconds, unused);
     }
 
-    int WaitForMultipleEvents(neosmart_event_t *events, int count, bool waitAll,
-                              uint64_t milliseconds, int &waitIndex) {
-        neosmart_wfmo_t wfmo = new neosmart_wfmo_t_;
+    int WaitForMultipleEvents(neosmart_event_t *events, const int count, const bool waitAll,
+                              const uint64_t milliseconds, int &waitIndex) {
+        const neosmart_wfmo_t wfmo = new neosmart_wfmo_t_;
 
         int result = 0;
-        int tempResult = pthread_mutex_init(&wfmo->Mutex, 0);
-        assert(tempResult == 0);
-
-        tempResult = pthread_cond_init(&wfmo->CVariable, 0);
-        assert(tempResult == 0);
+        const int tempResult = 0; // placeholder for asserts
+        (void)tempResult;
 
         neosmart_wfmo_info_t_ waitInfo;
         waitInfo.Waiter = wfmo;
@@ -211,8 +186,7 @@ namespace neosmart {
         // avoid repeatedly clearing the cache line.
         int skipped_refs = 0;
 
-        tempResult = pthread_mutex_lock(&wfmo->Mutex);
-        assert(tempResult == 0);
+        std::unique_lock<std::mutex> wfmo_lock(wfmo->Mutex);
 
         bool done = false;
         waitIndex = -1;
@@ -230,25 +204,8 @@ namespace neosmart {
                 }
             }
 
-            if (!skipLock) {
-                // Must not release lock until RegisteredWait is potentially added
-                tempResult = pthread_mutex_lock(&events[i]->Mutex);
-                assert(tempResult == 0);
-
-                // Before adding this wait to the list of registered waits, let's clean up old,
-                // expired waits while we have the event lock anyway.
-                events[i]->RegisteredWaits.erase(std::remove_if(events[i]->RegisteredWaits.begin(),
-                                                                events[i]->RegisteredWaits.end(),
-                                                                RemoveExpiredWaitHelper),
-                                                 events[i]->RegisteredWaits.end());
-            }
-
-            if (skipLock || UnlockedWaitForEvent(events[i], 0) == 0) {
-                if (!skipLock) {
-                    tempResult = pthread_mutex_unlock(&events[i]->Mutex);
-                    assert(tempResult == 0);
-                }
-
+            if (skipLock) {
+                // Manual-reset event observed signaled without locking.
                 if (waitAll) {
                     ++skipped_refs;
                     --wfmo->Status.EventsLeft;
@@ -260,11 +217,42 @@ namespace neosmart {
                     done = true;
                     break;
                 }
-            } else {
-                events[i]->RegisteredWaits.push_back(waitInfo);
+                continue;
+            }
 
-                tempResult = pthread_mutex_unlock(&events[i]->Mutex);
-                assert(tempResult == 0);
+            // Lock to safely inspect/modify state and to register waits
+            events[i]->Mutex.lock();
+
+            // Before adding this wait to the list of registered waits, clean up expired waits.
+            events[i]->RegisteredWaits.erase(std::remove_if(events[i]->RegisteredWaits.begin(),
+                                                            events[i]->RegisteredWaits.end(),
+                                                            RemoveExpiredWaitHelper),
+                                             events[i]->RegisteredWaits.end());
+
+            const bool signaled_now = events[i]->State.load(std::memory_order_relaxed);
+            if (!signaled_now) {
+                // Not signaled, register this WFMO waiter and continue
+                events[i]->RegisteredWaits.push_back(waitInfo);
+                events[i]->Mutex.unlock();
+                continue;
+            }
+
+            // Signaled: for auto-reset, consume it under the lock; for manual-reset, nothing to do
+            if (events[i]->AutoReset) {
+                events[i]->State.store(false, std::memory_order_relaxed);
+            }
+            events[i]->Mutex.unlock();
+
+            if (waitAll) {
+                ++skipped_refs;
+                --wfmo->Status.EventsLeft;
+                assert(wfmo->Status.EventsLeft >= 0);
+            } else {
+                skipped_refs += (count - i);
+                wfmo->Status.FiredEvent = i;
+                waitIndex = i;
+                done = true;
+                break;
             }
         }
 
@@ -275,20 +263,13 @@ namespace neosmart {
             done = true;
         }
 
-        timespec ts;
+        auto deadline = std::chrono::steady_clock::time_point::max();
         if (!done) {
             if (milliseconds == 0) {
                 result = WAIT_TIMEOUT;
                 done = true;
             } else if (milliseconds != WAIT_INFINITE) {
-                timeval tv;
-                gettimeofday(&tv, NULL);
-
-                uint64_t nanoseconds = ((uint64_t)tv.tv_sec) * 1000 * 1000 * 1000 +
-                                       milliseconds * 1000 * 1000 + ((uint64_t)tv.tv_usec) * 1000;
-
-                ts.tv_sec = (time_t) (nanoseconds / 1000 / 1000 / 1000);
-                ts.tv_nsec = (long) (nanoseconds - ((uint64_t)ts.tv_sec) * 1000 * 1000 * 1000);
+                deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
             }
         }
 
@@ -303,13 +284,12 @@ namespace neosmart {
 
             if (!done) {
                 if (milliseconds != WAIT_INFINITE) {
-                    result = pthread_cond_timedwait(&wfmo->CVariable, &wfmo->Mutex, &ts);
+                    if (wfmo->CVariable.wait_until(wfmo_lock, deadline) == std::cv_status::timeout) {
+                        result = WAIT_TIMEOUT;
+                        break;
+                    }
                 } else {
-                    result = pthread_cond_wait(&wfmo->CVariable, &wfmo->Mutex);
-                }
-
-                if (result != 0) {
-                    break;
+                    wfmo->CVariable.wait(wfmo_lock);
                 }
             }
         }
@@ -320,11 +300,10 @@ namespace neosmart {
         // with release semantics), then the mutex is always entered.
         wfmo->StillWaiting.store(false, std::memory_order_relaxed);
 
-        tempResult = pthread_mutex_unlock(&wfmo->Mutex);
-        assert(tempResult == 0);
+        wfmo_lock.unlock();
 
         // memory_order_seq_cst: Ensure this is run after the wfmo mutex is unlocked
-        int ref_count = wfmo->RefCount.fetch_sub(1 + skipped_refs, std::memory_order_seq_cst);
+        const int ref_count = wfmo->RefCount.fetch_sub(1 + skipped_refs, std::memory_order_seq_cst);
         assert(ref_count > 0);
         if (ref_count == 1 + skipped_refs) {
             wfmo->Destroy();
@@ -335,46 +314,34 @@ namespace neosmart {
     }
 #endif // WFMO
 
-    int DestroyEvent(neosmart_event_t event) {
-        int result = 0;
-
+    int DestroyEvent(const neosmart_event_t event) {
 #ifdef WFMO
-        result = pthread_mutex_lock(&event->Mutex);
-        assert(result == 0);
-        event->RegisteredWaits.erase(std::remove_if(event->RegisteredWaits.begin(),
-                                                    event->RegisteredWaits.end(),
-                                                    RemoveExpiredWaitHelper),
-                                     event->RegisteredWaits.end());
-        result = pthread_mutex_unlock(&event->Mutex);
-        assert(result == 0);
+        {
+            std::lock_guard<std::mutex> lock(event->Mutex);
+            event->RegisteredWaits.erase(std::remove_if(event->RegisteredWaits.begin(),
+                                                        event->RegisteredWaits.end(),
+                                                        RemoveExpiredWaitHelper),
+                                         event->RegisteredWaits.end());
+        }
 #endif
-
-        result = pthread_cond_destroy(&event->CVariable);
-        assert(result == 0);
-
-        result = pthread_mutex_destroy(&event->Mutex);
-        assert(result == 0);
-
         delete event;
-
         return 0;
     }
 
     int SetEvent(neosmart_event_t event) {
-        int result = pthread_mutex_lock(&event->Mutex);
-        assert(result == 0);
+        std::unique_lock<std::mutex> ev_lock(event->Mutex);
 
         // Depending on the event type, we either trigger everyone or only one
         if (event->AutoReset) {
 #ifdef WFMO
             while (!event->RegisteredWaits.empty()) {
-                neosmart_wfmo_info_t i = &event->RegisteredWaits.front();
+                const neosmart_wfmo_info_t i = &event->RegisteredWaits.front();
 
                 // memory_order_relaxed: this is just an optimization to see if it is OK to skip
                 // this waiter, and if it's observed to be false then it's OK to bypass the mutex at
                 // that point.
                 if (!i->Waiter->StillWaiting.load(std::memory_order_relaxed)) {
-                    int ref_count = i->Waiter->RefCount.fetch_sub(1, std::memory_order_acq_rel);
+                    const int ref_count = i->Waiter->RefCount.fetch_sub(1, std::memory_order_acq_rel);
                     assert(ref_count > 0);
                     if (ref_count == 1) {
                         i->Waiter->Destroy();
@@ -385,8 +352,7 @@ namespace neosmart {
                     continue;
                 }
 
-                result = pthread_mutex_lock(&i->Waiter->Mutex);
-                assert(result == 0);
+                std::unique_lock<std::mutex> waiter_lock(i->Waiter->Mutex);
 
                 // We have to check `Waiter->StillWaiting` twice, once before locking as an
                 // optimization to bypass the mutex altogether, and then again after locking the
@@ -394,11 +360,10 @@ namespace neosmart {
                 // wait, in which case we must not unlock the same waiter or else a SetEvent() call
                 // on an auto-reset event may end up with a lost wakeup.
                 if (!i->Waiter->StillWaiting.load(std::memory_order_relaxed)) {
-                    result = pthread_mutex_unlock(&i->Waiter->Mutex);
-                    assert(result == 0);
+                    waiter_lock.unlock();
 
                     // memory_order_seq_cst: Ensure this is run after the wfmo mutex is unlocked
-                    int ref_count = i->Waiter->RefCount.fetch_sub(1, std::memory_order_seq_cst);
+                    const int ref_count = i->Waiter->RefCount.fetch_sub(1, std::memory_order_seq_cst);
                     assert(ref_count > 0);
                     if (ref_count == 1) {
                         i->Waiter->Destroy();
@@ -423,14 +388,12 @@ namespace neosmart {
                     i->Waiter->StillWaiting.store(false, std::memory_order_relaxed);
                 }
 
-                result = pthread_mutex_unlock(&i->Waiter->Mutex);
-                assert(result == 0);
+                waiter_lock.unlock();
 
-                result = pthread_cond_signal(&i->Waiter->CVariable);
-                assert(result == 0);
+                i->Waiter->CVariable.notify_one();
 
                 // memory_order_seq_cst: Ensure this is run after the wfmo mutex is unlocked
-                int ref_count = i->Waiter->RefCount.fetch_sub(1, std::memory_order_seq_cst);
+                const int ref_count = i->Waiter->RefCount.fetch_sub(1, std::memory_order_seq_cst);
                 assert(ref_count > 0);
                 if (ref_count == 1) {
                     i->Waiter->Destroy();
@@ -439,8 +402,7 @@ namespace neosmart {
 
                 event->RegisteredWaits.pop_front();
 
-                result = pthread_mutex_unlock(&event->Mutex);
-                assert(result == 0);
+                ev_lock.unlock();
 
                 return 0;
             }
@@ -449,11 +411,9 @@ namespace neosmart {
             // for the event to become available.
             event->State.store(true, std::memory_order_release);
 
-            result = pthread_mutex_unlock(&event->Mutex);
-            assert(result == 0);
+            ev_lock.unlock();
 
-            result = pthread_cond_signal(&event->CVariable);
-            assert(result == 0);
+            event->CVariable.notify_one();
 
             return 0;
         } else { // this is a manual reset event
@@ -462,13 +422,13 @@ namespace neosmart {
             event->State.store(true, std::memory_order_release);
 #ifdef WFMO
             for (size_t i = 0; i < event->RegisteredWaits.size(); ++i) {
-                neosmart_wfmo_info_t info = &event->RegisteredWaits[i];
+                const neosmart_wfmo_info_t info = &event->RegisteredWaits[i];
 
                 // memory_order_relaxed: this is just an optimization to see if it is OK to skip
                 // this waiter, and if it's observed to be false then it's OK to bypass the mutex at
                 // that point.
                 if (!info->Waiter->StillWaiting.load(std::memory_order_relaxed)) {
-                    int ref_count = info->Waiter->RefCount.fetch_sub(1, std::memory_order_acq_rel);
+                    const int ref_count = info->Waiter->RefCount.fetch_sub(1, std::memory_order_acq_rel);
                     if (ref_count == 1) {
                         info->Waiter->Destroy();
                         delete info->Waiter;
@@ -476,8 +436,7 @@ namespace neosmart {
                     continue;
                 }
 
-                result = pthread_mutex_lock(&info->Waiter->Mutex);
-                assert(result == 0);
+                std::unique_lock<std::mutex> waiter_lock(info->Waiter->Mutex);
 
                 // Waiter->StillWaiting may have become true by now, but we're just going to pretend
                 // it hasn't. So long as we hold a reference to the WFMO, this is safe since manual
@@ -497,14 +456,12 @@ namespace neosmart {
                     info->Waiter->StillWaiting.store(false, std::memory_order_relaxed);
                 }
 
-                result = pthread_mutex_unlock(&info->Waiter->Mutex);
-                assert(result == 0);
+                waiter_lock.unlock();
 
-                result = pthread_cond_signal(&info->Waiter->CVariable);
-                assert(result == 0);
+                info->Waiter->CVariable.notify_one();
 
                 // memory_order_seq_cst: Ensure this is run after the wfmo mutex is unlocked
-                int ref_count = info->Waiter->RefCount.fetch_sub(1, std::memory_order_seq_cst);
+                const int ref_count = info->Waiter->RefCount.fetch_sub(1, std::memory_order_seq_cst);
                 assert(ref_count > 0);
                 if (ref_count == 1) {
                     info->Waiter->Destroy();
@@ -514,11 +471,9 @@ namespace neosmart {
             }
             event->RegisteredWaits.clear();
 #endif // WFMO
-            result = pthread_mutex_unlock(&event->Mutex);
-            assert(result == 0);
+            ev_lock.unlock();
 
-            result = pthread_cond_broadcast(&event->CVariable);
-            assert(result == 0);
+            event->CVariable.notify_all();
         }
 
         return 0;
@@ -554,111 +509,3 @@ namespace neosmart {
 #endif
 } // namespace neosmart
 
-#else // _WIN32
-
-#include <Windows.h>
-#include "pevents.h"
-
-namespace neosmart {
-    neosmart_event_t CreateEvent(bool manualReset, bool initialState) {
-        return static_cast<neosmart_event_t>(::CreateEvent(NULL, manualReset, initialState, NULL));
-    }
-
-    int DestroyEvent(neosmart_event_t event) {
-        HANDLE handle = static_cast<HANDLE>(event);
-        return CloseHandle(handle) ? 0 : GetLastError();
-    }
-
-    int WaitForEvent(neosmart_event_t event, uint64_t milliseconds) {
-        uint32_t result = 0;
-        HANDLE handle = static_cast<HANDLE>(event);
-
-        // WaitForSingleObject(Ex) and WaitForMultipleObjects(Ex) only support 32-bit timeout
-        if (milliseconds == WAIT_INFINITE || (milliseconds >> 32) == 0) {
-            result = WaitForSingleObject(handle, static_cast<uint32_t>(milliseconds));
-        } else {
-            // Cannot wait for 0xFFFFFFFF because that means infinity to WIN32
-            uint32_t waitUnit = static_cast<uint32_t>(WAIT_INFINITE) - 1;
-            uint64_t rounds = milliseconds / waitUnit;
-            uint32_t remainder = milliseconds % waitUnit;
-
-            result = WaitForSingleObject(handle, remainder);
-            while (result == WAIT_TIMEOUT && rounds-- != 0) {
-                result = WaitForSingleObject(handle, waitUnit);
-            }
-        }
-
-        if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) {
-            // We must swallow WAIT_ABANDONED because there is no such equivalent on *nix
-            return 0;
-        }
-
-        if (result == WAIT_TIMEOUT) {
-            return WAIT_TIMEOUT;
-        }
-
-        return GetLastError();
-    }
-
-    int SetEvent(neosmart_event_t event) {
-        HANDLE handle = static_cast<HANDLE>(event);
-        return ::SetEvent(handle) ? 0 : GetLastError();
-    }
-
-    int ResetEvent(neosmart_event_t event) {
-        HANDLE handle = static_cast<HANDLE>(event);
-        return ::ResetEvent(handle) ? 0 : GetLastError();
-    }
-
-#ifdef WFMO
-    int WaitForMultipleEvents(neosmart_event_t *events, int count, bool waitAll,
-                              uint64_t milliseconds) {
-        int index = 0;
-        return WaitForMultipleEvents(events, count, waitAll, milliseconds, index);
-    }
-
-    int WaitForMultipleEvents(neosmart_event_t *events, int count, bool waitAll,
-                              uint64_t milliseconds, int &index) {
-        HANDLE *handles = reinterpret_cast<HANDLE *>(events);
-        uint32_t result = 0;
-
-        // WaitForSingleObject(Ex) and WaitForMultipleObjects(Ex) only support 32-bit timeout
-        if (milliseconds == WAIT_INFINITE || (milliseconds >> 32) == 0) {
-            result = WaitForMultipleObjects(count, handles, waitAll,
-                                            static_cast<uint32_t>(milliseconds));
-        } else {
-            // Cannot wait for 0xFFFFFFFF because that means infinity to WIN32
-            uint32_t waitUnit = static_cast<uint32_t>(WAIT_INFINITE) - 1;
-            uint64_t rounds = milliseconds / waitUnit;
-            uint32_t remainder = milliseconds % waitUnit;
-
-            result = WaitForMultipleObjects(count, handles, waitAll, remainder);
-            while (result == WAIT_TIMEOUT && rounds-- != 0) {
-                result = WaitForMultipleObjects(count, handles, waitAll, waitUnit);
-            }
-        }
-
-        if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count) {
-            index = result - WAIT_OBJECT_0;
-            return 0;
-        } else if (result >= WAIT_ABANDONED_0 && result < WAIT_ABANDONED_0 + count) {
-            index = result - WAIT_ABANDONED_0;
-            return 0;
-        }
-
-        if (result == WAIT_FAILED) {
-            return GetLastError();
-        }
-        return result;
-    }
-#endif
-
-#ifdef PULSE
-    int PulseEvent(neosmart_event_t event) {
-        HANDLE handle = static_cast<HANDLE>(event);
-        return ::PulseEvent(handle) ? 0 : GetLastError();
-    }
-#endif
-} // namespace neosmart
-
-#endif //_WIN32

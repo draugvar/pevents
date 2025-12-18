@@ -8,14 +8,16 @@
 #pragma once
 
 #if defined(_WIN32) && !defined(CreateEvent)
-#error Must include Windows.h prior to including pevents.h!
+#include <Windows.h>
+#undef max
+#undef min
 #endif
 #ifndef WAIT_TIMEOUT
-#include <errno.h>
+#include <cerrno>
 #define WAIT_TIMEOUT ETIMEDOUT
 #endif
 
-#include <stdint.h>
+#include <cstdint>
 
 namespace neosmart {
     // Type declarations
@@ -23,7 +25,7 @@ namespace neosmart {
     typedef neosmart_event_t_ *neosmart_event_t;
 
     // Constant declarations
-    const uint64_t WAIT_INFINITE = ~((uint64_t)0);
+    constexpr uint64_t WAIT_INFINITE = ~static_cast<uint64_t>(0);
 
     // Function declarations
     neosmart_event_t CreateEvent(bool manualReset = false, bool initialState = false);
